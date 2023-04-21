@@ -1,11 +1,11 @@
 #!/usr/bin/python3
-# This script syncs the slurm jobs with the cluster cockpit backend. It uses 
+# This script syncs the slurm jobs with the cluster cockpit backend. It uses
 # the slurm command line tools to gather the relevant slurm infos and reads
-# the corresponding info from cluster cockpit via its api. 
-# 
-# After reading the data, it stops all jobs in cluster cockpit which are 
-# not running any more according to slurm and afterwards it creates all new 
-# running jobs in cluster cockpit. 
+# the corresponding info from cluster cockpit via its api.
+#
+# After reading the data, it stops all jobs in cluster cockpit which are
+# not running any more according to slurm and afterwards it creates all new
+# running jobs in cluster cockpit.
 #
 # -- Michael Schwarz <schwarz@uni-paderborn.de>
 
@@ -13,6 +13,32 @@ import subprocess
 import json
 import requests
 import re
+import pyslurm
+import logging
+import os,time
+import psutil
+
+import node_format
+
+class Logger():
+    logdir = ""
+    logfile = ""
+
+    def __init__(self, logdir):
+        self.logdir = logdir
+        if not os.path.exists(self.logdir):
+            os.mkdir(self.logdir)
+        self.logfile = os.path.join(self.logdir,time.strftime("%Y-%m-%d")+".log")
+
+    def generate(self):
+        logger = logging.getLogger("cc-slurm-sync")
+        logger.setLevel(logging.DEBUG)
+        lf = logging.FileHandler(filename=self.logfile,encoding="utf8")
+        lf.setLevel(logging.DEBUG)
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s : %(message)s")
+        lf.setFormatter(formatter)
+        logger.addHandler(lf)
+        return logger
 
 class CCApi:
     config = {}
@@ -24,7 +50,7 @@ class CCApi:
         self.config = config
         self.apiurl = "%s/api/" % config['cc-backend']['host']
         self.apikey = config['cc-backend']['apikey']
-        self.headers = { 'accept': 'application/ld+json', 
+        self.headers = { 'accept': 'application/ld+json',
                     'Content-Type': 'application/json',
                     'Authorization': 'Bearer %s' % self.config['cc-backend']['apikey']}
 
@@ -34,8 +60,8 @@ class CCApi:
         if r.status_code == 201:
             return r.json()
         else:
-            print(data)
-            print(r)
+            logger.error(data)
+            logger.error(r)
             return False
 
     def stopJob(self, data):
@@ -44,8 +70,8 @@ class CCApi:
         if r.status_code == 200:
             return r.json()
         else:
-            print(data)
-            print(r)
+            logger.error(data)
+            logger.error(r)
             return False
 
     def getJobs(self, filter_running=True):
@@ -60,6 +86,7 @@ class CCApi:
 
 class SlurmSync:
     slurmJobData = {}
+    slurmDBData = {}
     ccData = {}
     config = {}
     debug = False
@@ -68,19 +95,17 @@ class SlurmSync:
     def __init__(self, config, debug=False):
         self.config = config
         self.debug = debug
-        
-        # validate config TODO
+
+        # validate config
         if "slurm" not in config:
             raise KeyError
-        if "squeue" not in config['slurm']:
-            config.update({'squeue' : '/usr/bin/squeue'})
-        if "sacct" not in config['slurm']:
-            config.update({'sacct' : '/usr/bin/sacct'})
         if "cc-backend" not in config:
             raise KeyError
         if "host" not in config['cc-backend']:
             raise KeyError
         if "apikey" not in config['cc-backend']:
+            raise KeyError
+        if "pidfile" not in config:
             raise KeyError
 
         self.ccapi = CCApi(self.config, debug)
@@ -91,23 +116,26 @@ class SlurmSync:
         if process.returncode is 0:
             return output.decode('utf-8')
         else:
-            print("Error: ",error)
+            logger.error(error)
         return ""
 
     def _readSlurmData(self):
         if self.debug:
-            print("DEBUG: _readSlurmData called")
-        command = "%s --json" % self.config['slurm']['squeue']
-        self.slurmJobData = json.loads(self._exec(command))
+            logger.debug("_readSlurmData called")
+        slurm_jobs = pyslurm.job().get()
+        self.slurmJobData = slurm_jobs
+
+    def _readDBData(self):
+        slurm_job_lst = list(self.slurmJobData.keys())
+        cc_job_lst = [i['jobId'] for i in self.ccData['jobs']]
+        job_lst = slurm_job_lst + cc_job_lst
+        addtion_dbdata = pyslurm.slurmdb_jobs().get(jobids=job_lst)
+        self.slurmDBData = addtion_dbdata
 
     def _readCCData(self):
         if self.debug:
-            print("DEBUG: _readCCBackendData called")
+            logger.debug("_readCCBackendData called")
         self.ccData = self.ccapi.getJobs()
-
-    def _getAccDataForJob(self, jobid):
-        command = "%s -j %s --json" % (self.config['slurm']['sacct'], jobid)
-        return json.loads(self._exec(command))
 
     def _jobIdInCC(self, jobid):
         for job in self.ccData['jobs']:
@@ -116,10 +144,12 @@ class SlurmSync:
         return False
 
     def _jobRunning(self, jobid):
-        for job in self.slurmJobData['jobs']:
-            if int(job['job_id']) == int(jobid):
-                if job['job_state'] == 'RUNNING':
-                    return True
+        job = self.slurmJobData.get(jobid,{})
+        if not job:
+            return False
+        if int(job['job_id']) == int(jobid):
+            if job['job_state'] == 'RUNNING':
+                return True
         return False
 
     def _getACCIDsFromGRES(self, gres, nodename):
@@ -131,7 +161,7 @@ class SlurmSync:
                 nodetype = k
 
         if not nodetype:
-            print("WARNING: Can't find accelerator definition for node %s" % nodename.strip())
+            logger.warning("Can't find accelerator definition for node %s" % nodename.strip())
             return []
 
         # the gres definition might be different on other clusters!
@@ -160,15 +190,14 @@ class SlurmSync:
             for i in indexes:
                 acc_id_list.append(ids[nodetype][str(i)])
 
-            print(acc_id_list)
             return acc_id_list
 
         return []
 
     def _ccStartJob(self, job):
-        print("INFO: Crate job %s, user %s, name %s" % (job['job_id'], job['user_name'], job['name']))
-        nodelist = self._convertNodelist(job['job_resources']['nodes'])
-
+        job_id = job['job_id']
+        logger.info("Crate job %s, user %s, name %s" % (job_id, self.slurmDBData[job_id]['user'], job['name']))
+        nodelist = self._convertNodelist(job['nodes'])
         # Exclusive job?
         if job['shared'] == "none":
             exclusive = 1
@@ -183,18 +212,17 @@ class SlurmSync:
             exclusive = 0
 
         # read job script and environment
-        hashdir = "hash.%s" % str(job['job_id'])[-1]
-        jobscript_filename = "%s/%s/job.%s/script" % (self.config['slurm']['state_save_location'], hashdir, job['job_id'])
-        jobscript = ''
+
+        hashdir = "hash.%s" % str(job_id)[-1]
+        jobscript_command = 'scontrol write batch_script %s -' % job_id
         try:
-            with open(jobscript_filename, 'r', encoding='utf-8') as f:
-                jobscript = f.read()
-        except FileNotFoundError:
+            jobscript = self._exec(jobscript_command)
+        except:
             jobscript = 'NO JOBSCRIPT'
 
         environment = ''
         # FIXME sometimes produces utf-8 conversion errors
-        environment_filename = "%s/%s/job.%s/environment" % (self.config['slurm']['state_save_location'], hashdir, job['job_id'])
+        environment_filename = "%s/%s/job.%s/environment" % (self.config['slurm']['state_save_location'], hashdir, job_id)
         try:
             with open(environment_filename, 'r', encoding='utf-8') as f:
                 environment = f.read()
@@ -209,31 +237,90 @@ class SlurmSync:
 
 
         # get additional info from slurm and add environment
-        command = "scontrol show job %s" % job['job_id']
-        slurminfo = self._exec(command)
+        add_info = {
+            "JobId":job_id,
+            "JobName":job["name"],
+            "UserId":job["user_id"],
+            "GroupId":job["group_id"],
+            "Priority":job["priority"],
+            "Nice":job["nice"],
+            "Account":job["account"],
+            "QOS":job["qos"],
+            "JobState":job["job_state"],
+            "Reason":job["state_reason"],
+            "Dependency":job["dependency"],
+            "Requeue":job["requeue"],
+            "Restarts":job["restart_cnt"],
+            "BatchFlag":job["batch_flag"],
+            "Reboot":job["reboot"],
+            "ExitCode":job["exit_code"],
+            "RunTime":job["run_time_str"],
+            "TimeLimit":job["time_limit_str"],
+            "TimeMin":job["time_min"],
+            "AccrueTime":job["accrue_time"],
+            "SuspendTime":job["suspend_time"],
+            "LastSchedEval":job["last_sched_eval"],
+            "Partition":job["partition"],
+            "AllocNode:Sid":str(job["alloc_node"])+str(job["alloc_sid"]),
+            "ReqNodeList":job["req_nodes"],
+            "ExcNodeList":job["exc_nodes"],
+            "NodeList":job["nodes"],
+            "BatchHost":job["batch_host"],
+            "NumNodes":job["num_nodes"],
+            "NumCPUs":job["num_cpus"],
+            "NumTasks":job["num_tasks"],
+            "CPUs/Task":job["cpus_per_task"],
+            "TRES":job["tres_req_str"],
+            "MinCPUsNode":job["pn_min_cpus"],
+            "MinMemoryCPU":job["pn_min_memory"],
+            "MinTmpDiskNode":job["pn_min_tmp_disk"],
+            "Features":job["features"],
+            "Contiguous":job["contiguous"],
+            "Licenses":job["licenses"],
+            "Network":job["network"],
+            "Command":job["command"],
+            "WorkDir":job["work_dir"],
+            "StdErr":job["std_err"],
+            "StdIn":job["std_in"],
+            "StdOut":job["std_out"],
+            "Power":job["power_flags"]
+        }
+
+        slurminfo = str(add_info)
         slurminfo = slurminfo + "ENV:\n====\n" + environment
 
+        # change cluster manually, if it belongs to siyuan with gpfs storage system
+        # "192c6t"--mass,  "arm128c256g","debugarm","openeuler"--kp; these two are not in cluster right now
+        cluster_info = {
+            "sjtupi":["192c6t","arm128c256g","cpu","debug","debugarm","dgx2","huge","openeuler","small"],
+            "sjtusy":["64c512g","a100","debug64c512g","debuga100","win32"]
+            }
+        if job['partition'] in cluster_info["sjtusy"]:
+            cluster = "sjtusy"
+        else:
+            cluster = self.slurmDBData[job_id]['cluster']
+
         # build payload
-        data = {'jobId' : job['job_id'],
-            'user' : job['user_name'],
-            'cluster' : job['cluster'],
-            'numNodes' : job['node_count'],
-            'numHwthreads' : job['cpus'],
+        data = {'jobId' : job_id,
+            'user' : self.slurmDBData[job_id]['user'],
+            'cluster' : cluster,
+            'numNodes' : job['num_nodes'],
+            'numHwthreads' : job['num_cpus'],
             'startTime': job['start_time'],
             'walltime': int(job['time_limit']) * 60,
             'project': job['account'],
             'partition': job['partition'],
             'exclusive': exclusive,
             'resources': [],
-            'metadata': { 
-                'jobName' : job['name'], 
-                'jobScript' : jobscript, 
+            'metadata': {
+                'jobName' : job['name'],
+                'jobScript' : jobscript,
                 'slurmInfo' : slurminfo
                 }
             }
 
         # is this part of an array job?
-        if job['array_job_id'] > 0:
+        if job['array_job_id'] and job['array_job_id'] > 0:
             data.update({"arrayJobId" : job['array_job_id']})
 
         i = 0
@@ -244,25 +331,13 @@ class SlurmSync:
 
             # if a job uses a node exclusive, there are some assigned cpus (used by this job)
             # and some unassigned cpus. In this case, the assigned_cpus are those which have
-            # to be monitored, otherwise use the unassigned cpus. 
-            hwthreads = job['job_resources']['allocated_nodes'][str(i)]['cores']
-            cores_assigned = []
-            cores_unassigned = []
-            for k,v in hwthreads.items():
-                if v == "assigned":
-                    cores_assigned.append(int(k))
-                else:
-                    cores_unassigned.append(int(k))
-
-            if len(cores_assigned) > 0:
-                cores = cores_assigned
-            else:
-                cores = cores_unassigned
+            # to be monitored, otherwise use the unassigned cpus.
+            cores = job['cpus_alloc_layout'][node.strip()]
             resources.update({"hwthreads": cores})
 
             # Get allocated GPUs if some are requested
-            if len(job['gres_detail']) > 0:
-                
+            if 'gres_detail' in job and len(job['gres_detail']) > 0:
+
                 gres = job['gres_detail'][i]
                 acc_ids = self._getACCIDsFromGRES(gres, node)
                 if len(acc_ids) > 0:
@@ -277,13 +352,12 @@ class SlurmSync:
         data.update({"numAcc" : num_acc})
 
         if self.debug:
-            print(data)
-
+            logger.debug(data)
         self.ccapi.startJob(data)
-        
+
     def _ccStopJob(self, jobid):
-        print("INFO: Stop job %s" % jobid)
-        
+        logger.info("Stop job %s" % jobid)
+
         # get search for the jobdata stored in CC
         ccjob = {}
         for j in self.ccData['jobs']:
@@ -291,41 +365,39 @@ class SlurmSync:
                 ccjob = j
 
         # check if job is still in squeue data
-        for job in self.slurmJobData['jobs']:
+        job = self.slurmJobData.get(jobid,{})
+        if job:
             if job['job_id'] == jobid:
                 jobstate = job['job_state'].lower()
                 endtime = job['end_time']
                 if jobstate == 'requeued':
-                    print("Requeued job")
+                    logger.info("Requeued job")
                     jobstate = 'failed'
 
                     if int(ccjob['startTime']) >= int(job['end_time']):
-                        print("squeue correction")
-                        # For some reason (needs to get investigated), failed jobs sometimes report 
-                        # an earlier end time in squee than the starting time in CC. If this is the
-                        # case, take the starting time from CC and add ten seconds to the starting 
-                        # time as new end time. Otherwise CC refuses to end the job.
-                        endtime = int(ccjob['startTime']) + 1                    
+                        logger.info("squeue correction")
+                    # For some reason (needs to get investigated), failed jobs sometimes report
+                    # an earlier end time in squee than the starting time in CC. If this is the
+                    # case, take the starting time from CC and add ten seconds to the starting
+                    # time as new end time. Otherwise CC refuses to end the job.
+                        endtime = int(ccjob['startTime']) + 1
 
         else:
-            jobsAcctData = self._getAccDataForJob(jobid)['jobs']
-            for j in jobsAcctData:
-                if len(j['steps']) > 0 and j['steps'][0]['time']['start'] == ccjob['startTime']:
-                    jobAcctData = j
-            jobstate = jobAcctData['state']['current'].lower()
-            endtime = jobAcctData['time']['end']
+            jobAcctData = self.slurmDBData[jobid]
+            jobstate = jobAcctData['state_str'].lower()
+            endtime = jobAcctData['end']
 
             if jobstate == "node_fail":
                 jobstate = "failed"
             if jobstate == "requeued":
-                print("Requeued job")
+                logger.info("Requeued job")
                 jobstate = "failed"
 
                 if int(ccjob['startTime']) >= int(jobAcctData['time']['end']):
-                    print("sacct correction")
-                    # For some reason (needs to get investigated), failed jobs sometimes report 
+                    logger.info("sacct correction")
+                    # For some reason (needs to get investigated), failed jobs sometimes report
                     # an earlier end time in squee than the starting time in CC. If this is the
-                    # case, take the starting time from CC and add ten seconds to the starting 
+                    # case, take the starting time from CC and add ten seconds to the starting
                     # time as new end time. Otherwise CC refuses to end the job.
                     endtime = int(ccjob['startTime']) + 1
 
@@ -340,10 +412,10 @@ class SlurmSync:
         self.ccapi.stopJob(data)
 
     def _convertNodelist(self, nodelist):
+        logger.info("nodelist in _convertNodelist: %s" % nodelist)
         # Use slurm to convert a nodelist with ranges into a comma separated list of unique nodes
         if re.search(self.config['node_regex'], nodelist):
-            command = "scontrol show hostname %s | paste -d, -s" % nodelist
-            retval = self._exec(command).split(',')
+            retval = node_format.change_format([nodelist])
             return retval
         else:
             return []
@@ -351,10 +423,30 @@ class SlurmSync:
 
     def sync(self, limit=200, jobid=None, direction='both'):
         if self.debug:
-            print("DEBUG: sync called")
-            print("DEBUG: jobid %s" % jobid)
+            logger.debug("sync called")
+            logger.debug("jobid %s" % jobid)
         self._readSlurmData()
         self._readCCData()
+        self._readDBData()
+
+        # check the project state, if the old project si running, exit
+        pid_file = self.config["pidfile"]
+        if os.path.exists(pid_file):
+            with open(pid_file,"r") as f1:
+                pid = f1.readline().strip()
+                if not pid:
+                    pid_exist_state = False
+                else:
+                    old_pid = int(pid)
+                    if psutil.pid_exists(old_pid):
+                        pid_exist_state = True
+                    else:
+                        pid_exist_state = False
+                if pid_exist_state:
+                    exit()
+        now_pid = os.getpid()
+        with open(pid_file,"w") as f2:
+            f2.write(str(now_pid))
 
         # Abort after a defined count of sync actions. The intend is, to restart this script after the
         # limit is reached. Otherwise, if many many jobs get stopped, the script might miss some new jobs.
@@ -372,19 +464,20 @@ class SlurmSync:
                         self._ccStopJob(job['jobId'])
                         sync_count = sync_count + 1
                 if sync_count >= limit:
-                    print("INFO: sync limit (%s) reached" % limit)
+                    logger.info("sync limit (%s) reached" % limit)
                     break
 
         sync_count = 0
         # iterate over running jobs and add them to cc if they are still missing there
         if direction in ['both', 'start']:
-            for job in self.slurmJobData['jobs']:
+            for job_id,job in self.slurmJobData.items():
                 # Skip this job if the user does not want the metadata of this job to be submitted to ClusterCockpit
-                # The text field admin_comment is used for this. We assume that this field contains a comma seperated 
+                # The text field admin_comment is used for this. We assume that this field contains a comma seperated
                 # list of flags.
-                if "disable_cc_submission" in job['admin_comment'].split(','):
-                    print("INFO: Job %s: disable_cc_sumbission is set. Continue with next job" % job['job_id'])
-                    continue
+                if 'admin_comment' in job.keys():
+                    if "disable_cc_submission" in str(job['admin_comment']).split(','):
+                        logger.info("Job %s: disable_cc_sumbission is set. Continue with next job" % job['job_id'])
+                        continue
                 # consider only running jobs
                 if job['job_state'] == "RUNNING":
                     if jobid:
@@ -396,35 +489,37 @@ class SlurmSync:
                             self._ccStartJob(job)
                             sync_count = sync_count + 1
                 if sync_count >= limit:
-                    print("INFO: sync limit (%s) reached" % limit)
+                    logger.info("sync limit (%s) reached" % limit)
                     break
+        os.remove(pid_file)
 
 if __name__ == "__main__":
     import argparse
-    about = """This script syncs the slurm jobs with the cluster cockpit backend. It uses 
+    about = """This script syncs the slurm jobs with the cluster cockpit backend. It uses
         the slurm command line tools to gather the relevant slurm infos and reads
-        the corresponding info from cluster cockpit via its api. 
+        the corresponding info from cluster cockpit via its api.
 
-        After reading the data, it stops all jobs in cluster cockpit which are 
-        not running any more according to slurm and afterwards it creates all new 
-        running jobs in cluster cockpit. 
+        After reading the data, it stops all jobs in cluster cockpit which are
+        not running any more according to slurm and afterwards it creates all new
+        running jobs in cluster cockpit.
         """
     parser = argparse.ArgumentParser(description=about)
     parser.add_argument("-c", "--config", help="Read config file. Default: config.json", default="config.json")
     parser.add_argument("-d", "--debug", help="Enable debug output", action="store_true")
     parser.add_argument("-j", "--jobid", help="Sync this jobid")
     parser.add_argument("-l", "--limit", help="Stop after n sync actions in each direction. Default: 200", default="200", type=int)
+    parser.add_argument("-g", "--logdir", help="The directory path of log file.", default="logs")
     parser.add_argument("--direction", help="Only sync in this direction", default="both", choices=['both', 'start', 'stop'])
     args = parser.parse_args()
 
+    logger = Logger(args.logdir).generate()
     # open config file
     if args.debug:
-        print("DEBUG: load config file: %s" % args.config)
+        logger.debug("load config file: %s" % args.config)
     with open(args.config, 'r', encoding='utf-8') as f:
         config = json.load(f)
     if args.debug:
-        print("DEBUG: config file contents:")
-        print(config)
-
+        logger.debug("config file contents:")
+        logger.debug(config)
     s = SlurmSync(config, args.debug)
     s.sync(args.limit, args.jobid, args.direction)

@@ -26,5 +26,10 @@
 			"7": "00000000:BD:00.0"
 		}
 	},
-	"node_regex" : "^(n2(lcn|cn|fpga|gpu)[\\d{2,4}\\,\\-\\[\\]]+)+$"
+	"node_regex" : "^(n2(lcn|cn|fpga|gpu)[\\d{2,4}\\,\\-\\[\\]]+)+$",
+	"pidfile" : "/root/ClusterCockpit/cc-slurm-sync/test.pid",
+        "cluster_info":{
+            "cluster1":["partition1","partition2"],
+            "cluster2":["partition3","partition4"]
+            }
 }

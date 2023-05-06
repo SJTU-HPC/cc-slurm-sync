@@ -289,14 +289,9 @@ class SlurmSync:
         slurminfo = str(add_info)
         slurminfo = slurminfo + "ENV:\n====\n" + environment
 
-        # change cluster manually, if it belongs to siyuan with gpfs storage system
-        # "192c6t"--mass,  "arm128c256g","debugarm","openeuler"--kp; these two are not in cluster right now
-        cluster_info = {
-            "sjtupi":["192c6t","arm128c256g","cpu","debug","debugarm","dgx2","huge","openeuler","small"],
-            "sjtusy":["64c512g","a100","debug64c512g","debuga100","win32"]
-            }
-        if job['partition'] in cluster_info["sjtusy"]:
-            cluster = "sjtusy"
+        # change cluster name manually, if it belongs to cluster2
+        if job['partition'] in self.config["cluster_info"]["cluster2"]:
+            cluster = "cluster2"
         else:
             cluster = self.slurmDBData[job_id]['cluster']
 
